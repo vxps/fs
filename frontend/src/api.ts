@@ -1,13 +1,75 @@
 export type Sport='tennis'|'padel';
 export type Role='player'|'coach'|'admin';
-export type User={id:number;name:string;email:string;role:Role;sport:Sport;level:string;district:string;priority:string;experience:string;onboarding_complete:boolean;verified:boolean};
+
+export type User = {
+  id: number;
+  name: string;
+  email: string;
+  role: Role;
+  sport: Sport;
+  level: string;
+  district: string;
+  priority: string;
+  experience: string;
+  has_racket: boolean;
+  onboarding_complete: boolean;
+  verified: boolean;
+};
+
+export type Coach = {
+  id: number;
+  name: string;
+  headline: string;
+  bio: string;
+  sports: Sport[];
+  districts: string[];
+  club: string;
+  experience_years: number;
+  rating: number;
+  reviews: number;
+  price: number;
+  color: string;
+  emoji: string;
+  verified: boolean;
+  court_booker: 'player' | 'coach';
+  levels: string[];
+  formats: string[];
+  split_price: number;
+  group_price: number;
+  cancellation_policy: string;
+  ntrp: string | null;
+  slots?: Slot[];
+  courts?: Court[];
+};
+
+export type FeedItem = {
+  coach: Coach;
+  court: Court;
+  slot: Slot;
+  total_price: number;
+  court_options: {
+    court: Court;
+    slot: Slot;
+  }[];
+};
+
+export type Questionnaire = {
+  sport: Sport;
+  experience: string;
+  level: string;
+  district: string;
+  convenient_time: string;
+  priority: string;
+  goal: string;
+  has_racket: boolean;
+  ntrp: string | null;
+};
+
 export type Slot={id:number;starts_at:string;duration_minutes:number;available:boolean};
 export type Court={id:number;name:string;club:string;district:string;sport:Sport;surface:string;indoor:boolean;price:number;address:string};
-export type Coach={id:number;name:string;headline:string;bio:string;sports:Sport[];districts:string[];club:string;experience_years:number;rating:number;reviews:number;price:number;color:string;emoji:string;verified:boolean;court_booker:'player'|'coach';levels:string[];formats:string[];split_price:number;group_price:number;cancellation_policy:string;slots?:Slot[];courts?:Court[]};
-export type FeedItem={coach:Coach;court:Court;slot:Slot;total_price:number};
+
 export type BookingStatus='awaiting_court'|'confirmed'|'completed'|'no_show'|'cancelled';
 export type Booking={id:number;status:BookingStatus;starts_at:string;duration_minutes:number;coach_id:number;coach_name:string;player_name:string;club:string;sport:Sport;price:number;court_price:number;court:Court|null;court_booker:'player'|'coach';court_confirmation_code:string;objective:string;experience:string;need_racket:boolean;comment:string;created_at:string};
-export type Questionnaire={sport:Sport;experience:string;level:string;district:string;convenient_time:string;priority:string;goal:string};
 export type CoachMine={profile:Coach|null;settings:Record<string,string|number>|null;courts:number[];slots:Slot[]};
 export type AuthResponse={access_token:string;user:User};
 const base=(import.meta.env.VITE_API_BASE_URL||'').replace(/\/$/,'');

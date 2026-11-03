@@ -93,3 +93,94 @@ def seed(db: Session):
         db.add(User(name='Администратор FitSpot', email='admin@fitspot.local',
                     password_hash=hash_password('Admin123!'), role='admin'))
         db.commit()
+
+
+
+def replenish_demo_availability(
+    db: Session,
+    days: int = 21
+):
+    """Пополняет будущие демо-окна без изменения существующих."""
+    start = datetime.combine(
+        now_moscow().date(),
+        datetime.min.time()
+    )
+    end = start + timedelta(days=days)
+    current_time = now_moscow()
+
+    courts = db.scalars(
+        select(Court).where(
+            Court.club.like('FitSpot Клуб %')
+        )
+    ).all()
+
+    existing_windows = set(
+        db.execute(
+            select(
+                CourtWindow.court_id,
+                CourtWindow.starts_at
+            ).where(
+                CourtWindow.starts_at >= start,
+                CourtWindow.starts_at < end
+            )
+        ).all()
+    )
+
+    for court in courts:
+        for day_offset in range(days):
+            day = start.date() + timedelta(days=day_offset)
+
+            for hour in (10, 11, 13, 14, 16, 17, 18, 19, 20):
+                when = datetime.combine(
+                    day, datetime.min.time()
+                ).replace(hour=hour)
+
+                key = (court.id, when)
+
+                if when <= current_time or key in existing_windows:
+                    continue
+
+                db.add(CourtWindow(
+                    court_id=court.id,
+                    starts_at=when,
+                    available=True
+                ))
+                existing_windows.add(key)
+
+    demo_coaches = db.scalars(
+        select(Coach)
+        .join(User, Coach.user_id == User.id)
+        .where(User.email.like('coach%@fitspot.local'))
+    ).all()
+
+    existing_slots = set(
+        db.execute(
+            select(Slot.coach_id, Slot.starts_at).where(
+                Slot.starts_at >= start,
+                Slot.starts_at < end
+            )
+        ).all()
+    )
+
+    for coach in demo_coaches:
+        for day_offset in range(days):
+            day = start.date() + timedelta(days=day_offset)
+
+            for hour in (10, 14, 18):
+                when = datetime.combine(
+                    day, datetime.min.time()
+                ).replace(hour=hour)
+
+                key = (coach.id, when)
+
+                if when <= current_time or key in existing_slots:
+                    continue
+
+                db.add(Slot(
+                    coach_id=coach.id,
+                    starts_at=when,
+                    available=True
+                ))
+                existing_slots.add(key)
+
+    db.commit()

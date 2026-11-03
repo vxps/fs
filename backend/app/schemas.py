@@ -29,14 +29,22 @@ class TokenOut(BaseModel):
     access_token: str
     user: UserOut
 
+
 class QuestionnaireIn(BaseModel):
-    sport: Literal['tennis','padel']
+    sport: Literal['tennis', 'padel']
     experience: str = Field(min_length=1, max_length=120)
     level: str = Field(min_length=1, max_length=60)
-    district: str = Field(min_length=1, max_length=100)
+    district: str = Field(min_length=1, max_length=300)
     convenient_time: str = Field(min_length=1, max_length=80)
     priority: str = Field(min_length=1, max_length=80)
     goal: str = Field(min_length=1, max_length=150)
+
+    has_racket: bool = False
+    ntrp: str | None = Field(
+        default=None,
+        pattern=r'^(?:[1-6]\.[05]|7\.0)$'
+    )
+
 
 class CoachOnboardingIn(BaseModel):
     headline: str = Field(min_length=5, max_length=200)
@@ -55,8 +63,21 @@ class CoachOnboardingIn(BaseModel):
     duration_minutes: int = Field(default=60, ge=30, le=180)
     court_booker: Literal['player','coach'] = 'player'
     court_ids: list[int] = Field(min_length=1, max_length=20)
-    cancellation_policy: str = Field(min_length=10, max_length=220)
+        
+    cancellation_policy: Literal[
+        'Бесплатная отмена в любое время',
+        'Бесплатная отмена за 6 часов',
+        'Бесплатная отмена за 12 часов',
+        'Бесплатная отмена за 24 часа',
+    ]
+
     invite_code: str = Field(default='', max_length=60)
+
+    ntrp: str | None = Field(
+        default=None,
+        pattern=r'^(?:[1-6]\.[05]|7\.0)$'
+    )
+
 
 class SlotIn(BaseModel):
     starts_at: str

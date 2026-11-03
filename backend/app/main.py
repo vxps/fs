@@ -17,7 +17,7 @@ from .models import (User, PlayerQuestionnaire, Coach, CoachSettings, Slot, Book
 from .auth import validate_email, hash_password, verify_password, issue_token, current_user, SECRET
 from .schemas import (RegisterIn, LoginIn, UserOut, TokenOut, QuestionnaireIn,
                       CoachOnboardingIn, SlotIn, BookingIn, ConfirmCourtIn)
-from .seed import seed
+from .seed import seed, replenish_demo_availability
 
 @asynccontextmanager
 async def lifespan(_app):
@@ -30,6 +30,7 @@ async def lifespan(_app):
     if os.getenv('SEED_DEMO', 'true').lower() == 'true':
         with SessionLocal() as db:
             seed(db)
+            replenish_demo_availability(db)
     yield
 
 app = FastAPI(title='FitSpot API', version='0.2.0', lifespan=lifespan)
@@ -43,6 +44,10 @@ def health():
 def present_user(user: User):
     return {'id':user.id,'name':user.name,'email':user.email,'role':user.role,'sport':user.sport,
             'level':user.level,'district':user.district,'priority':user.priority,'experience':user.experience,
+            'has_racket': (
+                bool(user.questionnaire.has_racket)
+                if user.questionnaire else False
+            ),
             'onboarding_complete': bool(user.questionnaire) if user.role=='player' else bool(user.coach_settings and user.coach_settings.completed),
             'verified': bool(user.coach_profile and user.coach_profile.verified) if user.role=='coach' else False}
 
@@ -75,22 +80,56 @@ def login(data: LoginIn, db: Session=Depends(get_db)):
 def me(user: User=Depends(current_user)):
     return present_user(user)
 
-@app.post('/api/player/questionnaire')
-def questionnaire(data:QuestionnaireIn, db:Session=Depends(get_db), user:User=Depends(current_user)):
-    require_role(user,'player')
-    profile=user.questionnaire or PlayerQuestionnaire(user_id=user.id)
-    for key,value in data.model_dump().items(): setattr(profile,key,value.strip())
+
+@app.post("/api/player/questionnaire")
+def questionnaire(
+    data: QuestionnaireIn,
+    db: Session = Depends(get_db),
+    user: User = Depends(current_user),
+):
+    require_role(user, "player")
+
+    profile = user.questionnaire or PlayerQuestionnaire(
+        user_id=user.id
+    )
+
+    for key, value in data.model_dump().items():
+        setattr(
+            profile,
+            key,
+            value.strip() if isinstance(value, str) else value,
+        )
+
     db.add(profile)
-    for key in ('sport','experience','level','district','priority'): setattr(user,key,getattr(profile,key))
-    db.commit(); db.refresh(user)
+
+    for key in (
+        "sport",
+        "experience",
+        "level",
+        "district",
+        "priority",
+    ):
+        setattr(user, key, getattr(profile, key))
+
+    db.commit()
+    db.refresh(user)
+
     return present_user(user)
+
 
 @app.get('/api/player/questionnaire')
 def get_questionnaire(user:User=Depends(current_user)):
     require_role(user,'player')
     if not user.questionnaire: raise HTTPException(404,'Анкета не заполнена')
     q=user.questionnaire
-    return {key:getattr(q,key) for key in ('sport','experience','level','district','convenient_time','priority','goal')}
+    return {
+    key: getattr(q, key)
+    for key in (
+        'sport', 'experience', 'level', 'district',
+        'convenient_time', 'priority', 'goal',
+        'has_racket', 'ntrp'
+    )
+    }
 
 def court_out(c:Court):
     return {'id':c.id,'name':c.name,'club':c.club,'district':c.district,'sport':c.sport,
@@ -123,7 +162,8 @@ def coach_out(c:Coach,include_slots=False,db:Session|None=None):
             'formats':settings.formats.split(',') if settings else ['individual'],
             'split_price':settings.split_price if settings else 0,
             'group_price':settings.group_price if settings else 0,
-            'cancellation_policy':settings.cancellation_policy if settings else 'Бесплатная отмена за 24 часа'}
+            'cancellation_policy':settings.cancellation_policy if settings else 'Бесплатная отмена за 24 часа',
+            'ntrp': settings.ntrp if settings else None,}
     if include_slots and db:
         courtids=db.scalars(select(CoachCourt.court_id).where(CoachCourt.coach_id==c.id)).all()
         details['courts']=[court_out(r) for r in db.scalars(select(Court).where(Court.id.in_(courtids))).all()]
@@ -142,43 +182,215 @@ def coach_detail(coach_id:int,db:Session=Depends(get_db)):
     if not c or not c.verified: raise HTTPException(404,'Тренер не найден')
     return coach_out(c,True,db)
 
+
+@app.get('/api/coaches/{coach_id}/contact')
+def coach_contact(
+    coach_id: int,
+    db: Session = Depends(get_db),
+    user: User = Depends(current_user)
+):
+    require_role(user, 'player')
+
+    coach = db.get(Coach, coach_id)
+    if not coach or not coach.verified:
+        raise HTTPException(404, 'Тренер не найден')
+
+    booking_exists = db.scalar(
+        select(Booking.id)
+        .join(Slot, Booking.slot_id == Slot.id)
+        .where(
+            Slot.coach_id == coach_id,
+            Booking.player_id == user.id,
+            Booking.status != 'cancelled'
+        )
+        .limit(1)
+    )
+
+    if not booking_exists:
+        raise HTTPException(
+            403,
+            'Контакты доступны только после записи к тренеру'
+        )
+
+    settings = coach.user.coach_settings
+
+    return {
+        'telegram': settings.telegram if settings else '',
+        'phone': settings.phone if settings else ''
+    }
+
+
+
 @app.get('/api/feed')
-def feed(sport:str='',district:str='',sort:str='recommended',date:str='',period:str='',limit:int=Query(36,ge=1,le=100),db:Session=Depends(get_db)):
-    """Rank available coach+court combinations, never claim actual CRM availability."""
-    valid={'recommended','price','rating','time','court_price'}
-    if period not in ('','morning','afternoon','evening'):raise HTTPException(422,'Неизвестное время суток')
+def feed(
+    sport: str = '',
+    district: str = '',
+    districts: str = '',
+    sort: str = 'recommended',
+    date: str = '',
+    period: str = '',
+    limit: int = Query(36, ge=1, le=100),
+    db: Session = Depends(get_db)
+):
+    valid = {
+        'recommended', 'price', 'rating',
+        'time', 'court_price'
+    }
+
+    if sort not in valid:
+        raise HTTPException(422, 'Неизвестная сортировка')
+
+    if period not in ('', 'morning', 'afternoon', 'evening'):
+        raise HTTPException(422, 'Неизвестное время суток')
+
     if date:
-        try: datetime.strptime(date,'%Y-%m-%d')
-        except ValueError:raise HTTPException(422,'Неверная дата')
-    if sort not in valid: raise HTTPException(422,'Неизвестная сортировка')
-    coaches=db.scalars(select(Coach).where(Coach.verified.is_(True))).all()
-    result=[]
-    for coach in coaches:
-        if sport and sport not in coach.sports.split(','): continue
-        slots=db.scalars(select(Slot).where(Slot.coach_id==coach.id,Slot.available.is_(True),Slot.starts_at>now_moscow()).order_by(Slot.starts_at).limit(35)).all()
-        if date:slots=[v for v in slots if v.starts_at.date().isoformat()==date]
-        if period=='morning':slots=[v for v in slots if v.starts_at.hour<12]
-        if period=='afternoon':slots=[v for v in slots if 12<=v.starts_at.hour<17]
-        if period=='evening':slots=[v for v in slots if v.starts_at.hour>=17]
-        if not slots: continue
-        ids=db.scalars(select(CoachCourt.court_id).where(CoachCourt.coach_id==coach.id)).all()
-        linked=db.scalars(select(Court).where(Court.id.in_(ids))).all()
-        for court in linked:
-            if sport and court.sport!=sport: continue
-            if court.sport not in coach.sports.split(','): continue
-            if district and district!='Любой район' and court.district!=district:continue
-            starts=[s.starts_at for s in slots]
-            cw=db.scalar(select(CourtWindow).where(CourtWindow.court_id==court.id,CourtWindow.starts_at.in_(starts),CourtWindow.available.is_(True)).order_by(CourtWindow.starts_at).limit(1))
-            if not cw:continue
-            matching=next(s for s in slots if s.starts_at==cw.starts_at)
-            result.append({'coach':coach_out(coach),'court':court_out(court),'slot':slot_out(matching),
-                           'total_price':coach.price+court.price})
-    if sort=='price': key=lambda v:(v['total_price'],v['slot']['starts_at'])
-    elif sort=='court_price': key=lambda v:(v['court']['price'],v['total_price'])
-    elif sort=='rating': key=lambda v:(-v['coach']['rating'],v['total_price'])
-    elif sort=='time': key=lambda v:(v['slot']['starts_at'],v['total_price'])
-    else: key=lambda v:(-v['coach']['rating']*700+v['total_price']*.15,v['slot']['starts_at'])
-    return sorted(result,key=key)[:limit]
+        try:
+            datetime.strptime(date, '%Y-%m-%d')
+        except ValueError:
+            raise HTTPException(422, 'Неверная дата')
+
+    selected_districts = {
+        value.strip()
+        for value in (districts or district).split(',')
+        if value.strip() and value.strip() != 'Любой район'
+    }
+
+    coaches_list = db.scalars(
+        select(Coach).where(Coach.verified.is_(True))
+    ).all()
+
+    result = []
+
+    for coach in coaches_list:
+        if sport and sport not in coach.sports.split(','):
+            continue
+
+        slots = db.scalars(
+            select(Slot)
+            .where(
+                Slot.coach_id == coach.id,
+                Slot.available.is_(True),
+                Slot.starts_at > now_moscow()
+            )
+            .order_by(Slot.starts_at)
+            .limit(100)
+        ).all()
+
+        if date:
+            slots = [
+                s for s in slots
+                if s.starts_at.date().isoformat() == date
+            ]
+
+        if period == 'morning':
+            slots = [s for s in slots if s.starts_at.hour < 12]
+        elif period == 'afternoon':
+            slots = [
+                s for s in slots
+                if 12 <= s.starts_at.hour < 17
+            ]
+        elif period == 'evening':
+            slots = [s for s in slots if s.starts_at.hour >= 17]
+
+        if not slots:
+            continue
+
+        court_ids = db.scalars(
+            select(CoachCourt.court_id)
+            .where(CoachCourt.coach_id == coach.id)
+        ).all()
+
+        linked_courts = db.scalars(
+            select(Court).where(Court.id.in_(court_ids))
+        ).all()
+
+        slot_by_time = {s.starts_at: s for s in slots}
+
+        for court in linked_courts:
+            if sport and court.sport != sport:
+                continue
+
+            if court.sport not in coach.sports.split(','):
+                continue
+
+            if (
+                selected_districts
+                and court.district not in selected_districts
+            ):
+                continue
+
+            window = db.scalar(
+                select(CourtWindow)
+                .where(
+                    CourtWindow.court_id == court.id,
+                    CourtWindow.starts_at.in_(
+                        list(slot_by_time.keys())
+                    ),
+                    CourtWindow.available.is_(True)
+                )
+                .order_by(CourtWindow.starts_at)
+                .limit(1)
+            )
+
+            if not window:
+                continue
+
+            matching_slot = slot_by_time[window.starts_at]
+
+            result.append({
+                'coach': coach_out(coach),
+                'court': court_out(court),
+                'slot': slot_out(matching_slot),
+                'total_price': coach.price + court.price
+            })
+
+    if sort == 'price':
+        key = lambda v: (
+            v['total_price'],
+            v['slot']['starts_at']
+        )
+    elif sort == 'court_price':
+        key = lambda v: (
+            v['court']['price'],
+            v['total_price']
+        )
+    elif sort == 'rating':
+        key = lambda v: (
+            -v['coach']['rating'],
+            v['total_price']
+        )
+    elif sort == 'time':
+        key = lambda v: (
+            v['slot']['starts_at'],
+            v['total_price']
+        )
+    else:
+        key = lambda v: (
+            -v['coach']['rating'] * 700
+            + v['total_price'] * 0.15,
+            v['slot']['starts_at']
+        )
+
+    sorted_offers = sorted(result, key=key)
+
+    unique_coaches = {}
+
+    for offer in sorted_offers:
+        coach_id = offer['coach']['id']
+
+        if coach_id not in unique_coaches:
+            unique_coaches[coach_id] = {
+                **offer,
+                'court_options': []
+            }
+
+        unique_coaches[coach_id]['court_options'].append({
+            'court': offer['court'],
+            'slot': offer['slot']
+        })
+
+    return list(unique_coaches.values())[:limit]
+
 
 @app.get('/api/coaches/{coach_id}/slots/{slot_id}/courts')
 def available_courts(coach_id:int,slot_id:int,db:Session=Depends(get_db)):
@@ -187,6 +399,53 @@ def available_courts(coach_id:int,slot_id:int,db:Session=Depends(get_db)):
     ids=db.scalars(select(CoachCourt.court_id).where(CoachCourt.coach_id==coach_id)).all()
     windows=db.scalars(select(CourtWindow).where(CourtWindow.court_id.in_(ids),CourtWindow.starts_at==slot.starts_at,CourtWindow.available.is_(True))).all()
     return [court_out(db.get(Court,w.court_id)) for w in windows]
+
+
+@app.get('/api/coaches/{coach_id}/courts/{court_id}/slots')
+def coach_court_slots(
+    coach_id: int,
+    court_id: int,
+    db: Session = Depends(get_db)
+):
+    coach = db.get(Coach, coach_id)
+    if not coach or not coach.verified:
+        raise HTTPException(404, 'Тренер не найден')
+
+    linked = db.scalar(
+        select(CoachCourt.id).where(
+            CoachCourt.coach_id == coach_id,
+            CoachCourt.court_id == court_id
+        )
+    )
+
+    if not linked:
+        raise HTTPException(
+            404, 'Тренер не работает на выбранном корте'
+        )
+
+    available_times = (
+        select(CourtWindow.starts_at)
+        .where(
+            CourtWindow.court_id == court_id,
+            CourtWindow.available.is_(True),
+            CourtWindow.starts_at > now_moscow()
+        )
+    )
+
+    slots = db.scalars(
+        select(Slot)
+        .where(
+            Slot.coach_id == coach_id,
+            Slot.available.is_(True),
+            Slot.starts_at > now_moscow(),
+            Slot.starts_at.in_(available_times)
+        )
+        .order_by(Slot.starts_at)
+        .limit(100)
+    ).all()
+
+    return [slot_out(s) for s in slots]
+
 
 def get_own_coach(user:User,db:Session)->Coach:
     require_role(user,'coach')
@@ -223,8 +482,15 @@ def coach_onboarding(data:CoachOnboardingIn,db:Session=Depends(get_db),user:User
     coach.verified=False
     db.add(coach);db.flush()
     settings=user.coach_settings or CoachSettings(user_id=user.id)
-    for key in ('telegram','phone','photo_data_url','certificates','split_price','group_price','duration_minutes','court_booker','cancellation_policy','invite_code'):
-        setattr(settings,key,getattr(data,key))
+        
+    for key in (
+        'telegram', 'phone', 'photo_data_url',
+        'certificates', 'split_price', 'group_price',
+        'duration_minutes', 'cancellation_policy',
+        'invite_code', 'ntrp'
+    ):
+        setattr(settings, key, getattr(data, key))
+
     settings.completed=True; settings.levels=','.join(data.levels); settings.formats=','.join(data.formats)
     db.add(settings)
     for row in db.scalars(select(CoachCourt).where(CoachCourt.coach_id==coach.id)).all():db.delete(row)
